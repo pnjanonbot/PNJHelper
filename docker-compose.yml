@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    env_file:
+      - app/.env
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./app:/app
+    restart: unless-stopped
