@@ -1,11 +1,23 @@
 import os
 import asyncio
-from collections import deque
 from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 import logging
+
+from config.settings import BOT_TOKEN, ADMIN_USER_ID, CHAT_TIMEOUT
+from models.chat_manager import ChatManager
+from utils.helpers import create_stop_chat_keyboard, format_chat_ended_message
+from handlers.command_handlers import (
+    handle_start_command, 
+    handle_queue_command, 
+    handle_chat_command, 
+    handle_stop_command,
+    handle_help_command
+)
+from handlers.message_handlers import handle_message
+from handlers.callback_handlers import handle_callback_query
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -15,185 +27,127 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID"))
+# Initialize chat manager
+chat_manager = ChatManager(chat_timeout=CHAT_TIMEOUT)
 
-if not BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN is not set in .env")
-if not ADMIN_USER_ID:
-    raise ValueError("ADMIN_USER_ID is not set in .env")
+async def start_chat_with_user(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Start a chat session with a user"""
+    chat_manager.start_chat(user_id, ADMIN_USER_ID)
 
-user_queue = deque()
-active_chats = {}
-chat_start_times = {}
-timeout_tasks = {}
-
-async def handle_start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    logger.info(f"Received /start from user {user_id}")
-    await update.message.reply_text(
-        "Halo! Gunakan /chat untuk meminta obrolan dengan admin."
-    )
-
-async def handle_queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id == ADMIN_USER_ID:
-        await update.message.reply_text("Admin tidak bisa menggunakan perintah ini.")
-        return
-
-    if user_id in active_chats:
-        await update.message.reply_text("Kamu sedang dalam sesi obrolan. Gunakan /stop untuk mengakhiri.")
-        return
-
-    queue_position = None
-    if user_id in user_queue:
-        queue_position = user_queue.index(user_id) + 1
-
-    if queue_position:
-        total_in_queue = len(user_queue)
-        await update.message.reply_text(f"Kamu saat ini di posisi #{queue_position} dari {total_in_queue} antrian.")
-    else:
-        await update.message.reply_text("Kamu tidak ada dalam antrian saat ini.")
-
-async def handle_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    logger.info(f"Received /chat from user {user_id}")
-    if user_id == ADMIN_USER_ID:
-        await update.message.reply_text("Admin tidak bisa menggunakan perintah ini.")
-        return
-
-    if user_id in active_chats:
-        await update.message.reply_text("Kamu sedang dalam sesi obrolan. Gunakan /stop untuk mengakhiri.")
-        return
-
-    if user_id in user_queue:
-        queue_position = user_queue.index(user_id) + 1
-        total_in_queue = len(user_queue)
-        await update.message.reply_text(f"Kamu sudah ada dalam antrian di posisi #{queue_position} dari {total_in_queue}. Mohon bersabar.")
-        return
-
-    user_queue.append(user_id)
-
-    queue_position = len(user_queue)
-    total_in_queue = queue_position
-
-    if queue_position == 1 and ADMIN_USER_ID not in active_chats:
-        await start_chat_with_user(update, context, user_id)
-    else:
-        await update.message.reply_text(
-            f"Kamu telah masuk dalam antrian. Kamu di posisi #{queue_position} dari {total_in_queue}. Mohon menunggu."
+    keyboard = create_stop_chat_keyboard()
+    
+    try:
+        await context.bot.send_message(
+            chat_id=user_id, 
+            text="Kamu sekarang terhubung dengan admin. Silakan kirim pesan.", 
+            reply_markup=keyboard
         )
-        if queue_position == 2:
-            next_user_id = user_queue[0]
-            if next_user_id != user_id:
-                try:
-                    await context.bot.send_message(chat_id=next_user_id, text="Giliranmu hampir tiba. Bersiaplah untuk obrolan.")
-                except Exception as e:
-                    logger.error(f"Failed to send notification to user {next_user_id}: {e}")
+        await context.bot.send_message(
+            chat_id=ADMIN_USER_ID, 
+            text=f"User {user_id} sekarang terhubung. Obrolan dimulai."
+        )
+        logger.info(f"Chat started between user {user_id} and admin.")
 
-async def start_chat_with_user(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    user_queue.popleft()
-    active_chats[user_id] = ADMIN_USER_ID
-    active_chats[ADMIN_USER_ID] = user_id
-    chat_start_times[user_id] = datetime.now()
+        # Start timeout checker
+        await chat_manager.start_timeout_task(user_id, ADMIN_USER_ID, end_chat_callback)
+    except Exception as e:
+        logger.error(f"Failed to start chat with user {user_id}: {e}")
 
-    keyboard = [[InlineKeyboardButton("❌ Akhiri Obrolan", callback_data="stop_chat")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
 
-    if update:
-        await update.message.reply_text("Kamu sekarang terhubung dengan admin. Silakan kirim pesan.", reply_markup=reply_markup)
-    else:
-        await context.bot.send_message(chat_id=user_id, text="Kamu sekarang terhubung dengan admin. Silakan kirim pesan.", reply_markup=reply_markup)
+async def end_chat_callback(user_id: int, admin_id: int):
+    """Callback function when chat times out"""
+    await end_chat(user_id, admin_id, None)
 
-    await context.bot.send_message(chat_id=ADMIN_USER_ID, text=f"User {user_id} sekarang terhubung. Obrolan dimulai.")
-    logger.info(f"Chat started between user {user_id} and admin.")
 
-    if user_id in timeout_tasks:
-        timeout_tasks[user_id].cancel()
-    timeout_tasks[user_id] = context.application.create_task(timeout_checker(user_id, context))
+async def end_chat(user_id: int, admin_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """End a chat session"""
+    chat_manager.end_chat(user_id, admin_id)
+    
+    if context:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=f"Obrolan dengan user {user_id} telah berakhir.")
+            await context.bot.send_message(chat_id=user_id, text=format_chat_ended_message())
+        except Exception as e:
+            logger.error(f"Failed to send end chat messages: {e}")
+    
+    logger.info(f"Chat ended between user {user_id} and admin.")
 
-async def handle_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Start next chat if available
+    next_user_id = chat_manager.get_next_user_in_queue()
+    if next_user_id and not chat_manager.is_user_in_active_chat(admin_id):
+        if context:
+            await start_chat_with_user(next_user_id, context)
+
+
+async def handle_stop_command_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Wrapper for stop command that handles the actual chat ending"""
     user_id = update.effective_user.id
-    admin_id = ADMIN_USER_ID
-    logger.info(f"Received /stop from user {user_id}")
-    if active_chats.get(user_id) == admin_id or active_chats.get(admin_id) == user_id:
-        await end_chat(user_id, admin_id, context)
+    if (chat_manager.get_active_chat_partner(user_id) == ADMIN_USER_ID or 
+        chat_manager.get_active_chat_partner(ADMIN_USER_ID) == user_id):
+        await end_chat(user_id, ADMIN_USER_ID, context)
+        if update.message:
+            await update.message.reply_text("Obrolan telah diakhiri.")
     else:
-        await update.message.reply_text("Kamu tidak sedang dalam sesi obrolan.")
+        if update.message:
+            await update.message.reply_text("Kamu tidak sedang dalam sesi obrolan.")
 
-async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def handle_callback_query_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Wrapper for callback query handling"""
     query = update.callback_query
     await query.answer()
 
     if query.data == "stop_chat":
         user_id = query.from_user.id
-        admin_id = ADMIN_USER_ID
-        if active_chats.get(user_id) == admin_id or active_chats.get(admin_id) == user_id:
-            await end_chat(user_id, admin_id, context)
-            await query.edit_message_text(text="Obrolan telah berakhir. Terima kasih!")
+        if (chat_manager.get_active_chat_partner(user_id) == ADMIN_USER_ID or 
+            chat_manager.get_active_chat_partner(ADMIN_USER_ID) == user_id):
+            await end_chat(user_id, ADMIN_USER_ID, context)
+            await query.edit_message_text(text=format_chat_ended_message())
         else:
             await query.edit_message_text(text="Kamu tidak sedang dalam sesi obrolan.")
 
-async def end_chat(user_id: int, admin_id: int, context: ContextTypes.DEFAULT_TYPE):
-    active_chats.pop(user_id, None)
-    active_chats.pop(admin_id, None)
-    chat_start_times.pop(user_id, None)
-    if user_id in timeout_tasks:
-        timeout_tasks[user_id].cancel()
-        timeout_tasks.pop(user_id, None)
 
-    await context.bot.send_message(chat_id=admin_id, text=f"Obrolan dengan user {user_id} telah berakhir.")
-    await context.bot.send_message(chat_id=user_id, text="Obrolan telah berakhir. Terima kasih!")
-    logger.info(f"Chat ended between user {user_id} and admin.")
-
-    if user_queue:
-        next_user_id = user_queue[0]
-        await start_chat_with_user(None, context, next_user_id)
-
-async def timeout_checker(user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Timeout task started for user {user_id}, waiting 5 minutes.")
-    try:
-        await asyncio.sleep(300)
-        if active_chats.get(user_id) == ADMIN_USER_ID:
-            logger.info(f"Timeout reached for user {user_id}. Ending chat.")
-            await end_chat(user_id, ADMIN_USER_ID, context)
-    except asyncio.CancelledError:
-        logger.info(f"Timeout task for user {user_id} was cancelled.")
-        raise
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Wrapper for message handling that includes chat timeout reset"""
     user_id = update.effective_user.id
-    admin_id = ADMIN_USER_ID
-    logger.info(f"Received message from user {user_id}")
-
-    if active_chats.get(user_id) == admin_id:
+    
+    # If user is in active chat with admin, forward message to admin
+    if chat_manager.get_active_chat_partner(user_id) == ADMIN_USER_ID:
         try:
-            await context.bot.copy_message(chat_id=admin_id, from_chat_id=user_id, message_id=update.message.message_id)
+            await context.bot.copy_message(chat_id=ADMIN_USER_ID, from_chat_id=user_id, message_id=update.message.message_id)
             logger.info(f"Forwarded message from user {user_id} to admin.")
-            if user_id in timeout_tasks:
-                timeout_tasks[user_id].cancel()
-            timeout_tasks[user_id] = context.application.create_task(timeout_checker(user_id, context))
+            
+            # Reset timeout
+            chat_manager.cancel_timeout_task(user_id)
+            await chat_manager.start_timeout_task(user_id, ADMIN_USER_ID, end_chat_callback)
         except Exception as e:
             logger.error(f"Failed to forward message from user {user_id} to admin: {e}")
-            await update.message.reply_text(f"Gagal mengirim pesan: {e}")
-        return
-
-    if user_id == admin_id:
-        user_in_chat = active_chats.get(admin_id)
-        if user_in_chat:
-            try:
-                await context.bot.copy_message(chat_id=user_in_chat, from_chat_id=admin_id, message_id=update.message.message_id)
-                logger.info(f"Forwarded message from admin to user {user_in_chat}.")
-                if user_in_chat in timeout_tasks:
-                    timeout_tasks[user_in_chat].cancel()
-                timeout_tasks[user_in_chat] = context.application.create_task(timeout_checker(user_in_chat, context))
-            except Exception as e:
-                logger.error(f"Failed to forward message from admin to user {user_in_chat}: {e}")
+            if update.message:
                 await update.message.reply_text(f"Gagal mengirim pesan: {e}")
         return
 
-    if user_id != admin_id:
-        await update.message.reply_text("Gunakan /chat untuk meminta obrolan dengan admin.")
+    # If admin is sending message, forward to user in active chat
+    if user_id == ADMIN_USER_ID:
+        user_in_chat = chat_manager.get_active_chat_partner(ADMIN_USER_ID)
+        if user_in_chat:
+            try:
+                await context.bot.copy_message(chat_id=user_in_chat, from_chat_id=ADMIN_USER_ID, message_id=update.message.message_id)
+                logger.info(f"Forwarded message from admin to user {user_in_chat}.")
+                
+                # Reset timeout for the user
+                chat_manager.cancel_timeout_task(user_in_chat)
+                await chat_manager.start_timeout_task(user_in_chat, ADMIN_USER_ID, end_chat_callback)
+            except Exception as e:
+                logger.error(f"Failed to forward message from admin to user {user_in_chat}: {e}")
+                if update.message:
+                    await update.message.reply_text(f"Gagal mengirim pesan: {e}")
+        return
+
+    # If user is not in chat, direct them to use /chat command
+    if user_id != ADMIN_USER_ID:
+        if update.message:
+            await update.message.reply_text("Gunakan /chat untuk meminta obrolan dengan admin.")
+
 
 def main():
     logger.info("Bot is starting...")
@@ -205,12 +159,14 @@ def main():
         print(f"Error: {e}")
         return
 
-    application.add_handler(CommandHandler("start", handle_start_command))
-    application.add_handler(CommandHandler("chat", handle_chat_command))
-    application.add_handler(CommandHandler("queue", handle_queue_command))
-    application.add_handler(CommandHandler("stop", handle_stop_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(CallbackQueryHandler(handle_callback_query))
+    # Add handlers
+    application.add_handler(CommandHandler("start", lambda u, c: handle_start_command(u, c, chat_manager)))
+    application.add_handler(CommandHandler("queue", lambda u, c: handle_queue_command(u, c, chat_manager)))
+    application.add_handler(CommandHandler("chat", lambda u, c: handle_chat_command(u, c, chat_manager)))
+    application.add_handler(CommandHandler("stop", handle_stop_command_wrapper))
+    application.add_handler(CommandHandler("help", handle_help_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_wrapper))
+    application.add_handler(CallbackQueryHandler(handle_callback_query_wrapper))
 
     logger.info("Handlers added. Starting polling...")
     try:
